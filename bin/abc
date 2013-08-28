@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# 
+# <<HELP
+# abc - Apache Benchmark Charter
+# 
+# Usage
+#   {script} <ab command arguments>
+# Example
+#   {script} -n 100 -c 10 http://google.com/
+# 
+# You can report bugs on http://github.com/augustohp/abc
+#HELP
+
+# Boot _________________________________________________________________________
+
+if [[ -t 1 ]]; then
+	declare -r SCRIPT_INTERACTIVE=1
+else
+	declare -r SCRIPT_INTERACTIVE=0
+fi
+
+if [ -z ${ABC_PROJECTS} ]; then
+	ABC_PROJECTS="${HOME}/abc-projects"
+fi;
+
+declare -r SCRIPT=$(readlink "${0}" 2> /dev/null || echo "${0}")
+declare -r SCRIPT_NAME=$(basename ${0})
+declare -r SCRIPT_PID=$(echo ${$})
+declare -r ROOT_DIRECTORY=$(cd "$(dirname "${SCRIPT}")/.." && pwd)
+declare -r AB_RESULT="/tmp/abc-content"
+declare -r GNUPLOT_DATA="/tmp/abc-gnuplot.data"
+declare -r SERVED_PERCENTAGE="/tmp/abc-served.csv"
+declare -r ABC_STORAGE=${ABC_PROJECTS}
+declare -r ABC_SESSION_FORMAT="%Y-%m-%d_%H:%M:%S"
+
+# Functions ____________________________________________________________________
+#                                      https://github.com/henriquemoody/deployer
+_help()
+{
+	local skip
+	local lines
+	local msg
+	skip=$(grep -n "# <<HELP" ${SCRIPT} | head -n 1 |cut -d: -f1)
+	lines=$(grep -n "#HELP" ${SCRIPT} | head -n 1 | cut -d: -f1)
+	msg=$(head -n `expr ${lines} - 1` ${SCRIPT} | tail -n `expr ${lines} - ${skip} - 1`)
+	echo "${msg}" | sed -E 's/^# \s?(.*)/\1/g' | sed "s/{script}/${SCRIPT_NAME}/g"
+}
+
+_out()
+{
+	local params
+	local message
+	params="-e"
+	while [[ ${1} = -* ]]; do
+		params="${params} ${1}"
+		shift
+	done
+
+	message="${@}<0>"
+	if [ ${SCRIPT_INTERACTIVE} -eq 1 ]; then
+		message=$(echo "${message}" | sed -E $'s/<([0-9;]+)>/\033\[\\1m/g')
+	else
+		message=$(echo "${message}" | sed -E 's/<[0-9;]+>//g')
+	fi
+
+	echo ${params} "${message}"
+}
+
+#TODO: Show ab output as it goes
+#TODO: Check for harm `ab` arguments
+_ab()
+{
+	local exit_code;
+	local complete_ab_args;
+	complete_ab_args="-e ${SERVED_PERCENTAGE} -g ${GNUPLOT_DATA} ${AB_ARGS}"
+	ab ${complete_ab_args} > ${AB_RESULT} 2> ${AB_RESULT}
+	exit_code=$?
+	if [ $exit_code -eq 0 ]; then
+		cat ${AB_RESULT}
+		_parse_and_store
+		exit 0;
+	fi
+	head -n 1 ${AB_RESULT}
+	exit $exit_code;
+}
+
+#TODO: Make this a proper (unix) command that can receive `ab` output as input
+#TODO: `run.sh` without hard-coded paths
+_parse_and_store()
+{
+	local project;
+	local session;
+	local now;
+	local session_path;
+	local run_path;
+	local script;
+	session=$(echo "${AB_ARGS}" | sed 's/[\-]//g' | sed 's/[ ]//g' | sed 's/[http\://].*$//g' | tr -d " ")
+	project=$(cat ${AB_RESULT} | grep "Server Hostname" | cut -d: -f2 | tr -d ' ')
+	session_path="${ABC_STORAGE}/${project}/${session}"
+	now=$(date "+${ABC_SESSION_FORMAT}")
+	run_path="${session_path}/${now}"
+	mkdir -p "${run_path}"
+	if [ $? -ne 0 ]; then
+		_out "Could not create: ${run_path}"
+		exit 3;
+	fi;
+	mv ${GNUPLOT_DATA} "${run_path}/gnuplot.data"
+	mv ${SERVED_PERCENTAGE} "${run_path}/runtime.csv"
+	mv ${AB_RESULT} "${run_path}/ab.out"
+	script=$(cat <<-meneither
+		#!/usr/bin/env bash
+		# Generated with http://github.com/augustohp/abc
+
+		current_time=\$(date "+${ABC_SESSION_FORMAT}")
+		output_path="${session_path}/\${current_time}"
+		mkdir -p "\${output_path}" &&
+		  ab -g "\${output_path}/gnuplot.data" -e "\${output_path}/runtime.csv" ${AB_ARGS} >> \\
+		  \${output_path}/ab.out
+meneither)
+	_out "$script" > "${session_path}/run.sh" && chmod a+x "${session_path}/run.sh"
+}
+
+# Script _______________________________________________________________________
+
+if [ -z `which ab` ]; then
+	_out "ab command not found.";
+	exit 2;
+fi
+
+if [ -z "$*" ]; then
+	_help
+	exit 0
+fi;
+
+# Run `ab`
+declare AB_ARGS="$*"
+_ab ${AB_ARGS}
